@@ -1,5 +1,5 @@
 
-##Ruby script to interact with s3 buckets**
+## Ruby script to interact with s3 buckets
 
 Provides options to:
 
