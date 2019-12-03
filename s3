@@ -1,0 +1,576 @@
+#!/usr/bin/env ruby
+
+require 'aws-sdk-s3'
+require 'pathname'
+require 'zip'
+require 'json'
+require 'optparse'
+
+bucket_exists = false
+object_exists = false
+metadata_exists = false
+
+region = 'ap-southeast-2'
+profile = 's3play'
+
+account = ENV['AWS_ACCOUNT']
+
+###TO DO####
+#encryption
+#metadata: key: pair
+#tags
+#catch exceptions
+
+def help
+  <<-HELP
+List buckets              -a lb
+List bucket sizes         -a lbs
+Create bucket             -a b -b <bucketname>
+Add bucket policy         -a ap -b <bucketname> -u <account:user or user>
+Show bucket policy        -a sp -b <bucketname>
+Delete bucket policy      -a dp -b <bucketname>
+Add bucket ACL            -a aa -b <bucketname> -c <canned_acl_profile: pr, pur, purw, aer, ar, bor, bof, ldw>
+Add object ACL            -a aa -b <bucketname> -k <key> -c <canned_acl_profile: pr, pur, purw, aer, ar, bor, bof, ldw>
+Delete bucket             -a db -b <bucketname>
+Detail bucket info        -a ib -b <bucketname>
+List bucket Files         -a lf -b <bucketname>
+Add file, zip if folder
+metadata optional         -a f -b <bucketname> -k <key> -f <filename> -m <metakey_1:value_1...>
+Detail file info          -a if -b <bucketname> -k <key>
+Delete file from bucket   -a df -b <bucketname> -k <key>
+Download file             -a rf -b <bucketname> -k <key> -f <new_filename>
+Download file and unzip   -a rfu -b <bucketname> -k <key> -f <filename>
+Add lifecycle to bucket   -a al -b <bucketname> -l <json file>
+Delete lifecycle          -a dl -b <bucketname>
+Show lifecycle            -a sl -b <bucketname>
+
+HELP
+end
+
+options = {}
+opt_parser = OptionParser.new do |opts|
+  opts.banner = help
+
+  opts.on('-a', '--action ACTION', [:lb, :lbs, :b, :ap, :sp, :dp, :aa, :db, :ib, :lf, :if, :f, :df, :rf, :rfu, :al, :dl, :sl], "Select action: 'lb, lbs, b, ap, sp, dp, aa, db, ib, lf, if, f, df, rf, rfu, al, dl, sl") do |action|
+    options[:action] = action
+  end
+
+  opts.on('-b', '--bucket BUCKET', String, "Enter Bucket name") do |bucket|
+    options[:bucket] = bucket
+  end
+
+  opts.on('-k', '--key KEY', String, "Enter Key name") do |key|
+    options[:key] = key
+  end
+
+  opts.on('-f', '--file FILE', String, "Enter File name") do |file|
+    options[:file] = file
+  end
+
+  opts.on('-m', '--meta KEY=VALUE,...', Array, "Enter Metadata") do |meta|
+    options[:meta] = meta
+  end
+
+  opts.on('-c', '--cacl ACL', String, "Enter ACL canned profile: pr : private, pur : public-read, purw : public-read-write, aer : aws-exec-read, ar : authenticated-read, bor : bucket-owner-read, bof : bucket-owner-full-control, ldw : log-delivery-write") do |cacl|
+    options[:cacl] = cacl
+  end
+
+  opts.on('-l', '--lifecycle LIFECYCLE', String, "Enter Lifecycle file name") do |lifecycle|
+    options[:lifecycle] = lifecycle
+  end
+
+  opts.on('-u', '--user USER', String, "Enter User name") do |user|
+    options[:user] = user
+  end
+
+  opts.on('-t', '--tags KEY=VALUE,...', Array, "Enter tags") do |tags|
+    options[:tags] = tags.map { |t|
+      t.split('=')
+    }.to_h.map { |k,v| {key: k, value: v} }
+  end
+
+  opts.on('-h', '--help', 'returns the help menu') do |h|
+    puts opts
+    exit
+  end
+
+end.parse!
+
+bucket_ = options[:bucket]
+key_ = options[:key]
+file_ = options[:file]
+
+s3 = Aws::S3::Client.new(
+  profile: profile,
+  region: region)
+
+#use resource for uploading files
+s3_res = Aws::S3::Resource.new(
+  profile: profile,
+  region: region)
+
+if options[:action] == :lb
+  #list buckets
+  puts ""
+  puts "Buckets: "
+  puts "================="
+  puts "Name:"
+  resp = s3.list_buckets
+  resp.buckets.each do |bucket|
+
+    puts bucket.name
+  end
+  puts ""
+
+elsif options[:action] == :lbs
+  #list buckets with size and no. of files
+
+  puts ""
+  puts "Buckets: "
+  puts "======================================="
+  printf("%-16s %-10s %s\n", "Name:", "Size:", "Objects:" )
+
+  resp = s3.list_buckets
+  resp.buckets.each do |bucket|
+    total_size = 0
+    count = 0
+    resp_ = s3.list_objects_v2(bucket: bucket.name)
+    resp_.contents.each do |obj|
+      unless obj.nil?
+        total_size += obj.size
+        count += 1
+      end
+    end
+  # puts "#{bucket.name}          #{total_size}       #{count}"
+  printf("%-16s %-10s %s\n", bucket.name, total_size, count )
+  end
+
+
+elsif options[:action] == :b
+  #create bucket
+  #check if bucket already exists
+  begin
+    resp = s3.head_bucket({bucket: bucket_, use_accelerate_endpoint: false})
+    bucket_exists = true
+  rescue
+  end
+  #create bucket
+  if bucket_exists
+    puts "#{bucket_} bucket already exists"
+  else
+    s3.create_bucket(bucket: bucket_)
+    s3.wait_until(:bucket_exists, {
+      bucket: bucket_,
+      })
+    puts "Bucket #{bucket_} created"
+  end
+
+elsif options[:action] == :ap
+
+  if !options[:user].nil?
+    s = options[:user].split(":")
+    if s.length == 2
+      account = s[0]
+      user = s[1]
+    elsif s.length == 1 && !account.nil?
+      user = s[0]
+    else
+      abort "Policy format is account:user or user (if using default account)"
+    end
+  end
+
+  policy = {
+    "Version" => "2012-10-17",
+    "Statement" => [
+      {
+        "Effect" => "Allow",
+        "Principal" => {
+          "AWS" => [
+            "arn:aws:iam::#{account}:user/#{user}"
+          ]
+        },
+        "Action" => "s3:*",
+        "Resource" => [
+          "arn:aws:s3:::#{bucket_}"
+        ]
+      }
+    ]
+  }.to_json
+
+  begin
+    s3.put_bucket_policy({
+      bucket: bucket_,
+      policy: policy,
+      })
+    puts "Policy applied to bucket: #{bucket_}"
+  rescue Aws::S3::Errors::NoSuchBucket
+    abort "Bucket #{bucket_} does not exist"
+  rescue Aws::S3::Errors::MalformedPolicy
+    abort "MalformedPolicy: Policy format is account:user or user (if using default account)"
+  end
+
+elsif options[:action] == :sp
+
+  begin
+    policy_string = s3.get_bucket_policy({
+      bucket: bucket_
+      }).policy.read
+
+    policy_json = JSON.parse(policy_string)
+    puts policy_json
+  rescue Aws::S3::Errors::NoSuchBucket
+    abort "Bucket #{bucket_} does not exist"
+  rescue Aws::S3::Errors::NoSuchBucketPolicy
+    abort "Bucket #{bucket_} does not have policy"
+  end
+
+elsif options[:action] == :dp
+
+  begin
+    policy_string = s3.get_bucket_policy({
+      bucket: bucket_
+      }).policy.read
+
+    s3.delete_bucket_policy({
+      bucket: bucket_
+      })
+  rescue Aws::S3::Errors::NoSuchBucket
+    abort "Bucket #{bucket_} does not exist"
+  rescue Aws::S3::Errors::NoSuchBucketPolicy
+    abort "Bucket #{bucket_} does not have policy"
+  end
+
+elsif options[:action] == :aa
+
+  case options[:cacl]
+  when "pr"
+    acl_ = "private"
+  when "pur"
+    acl_ = "public-read"
+  when "purw"
+    acl_ = "public-read-write"
+  when "aer"
+    acl_ = "aws-exec-read"
+  when "ar"
+    acl_ = "authenticated-read"
+  when "bor"
+    acl_ = "bucket-owner-read"
+  when "bof"
+    acl_ = "bucket-owner-full-control"
+  when "ldw"
+    acl_ = "log-delivery-write"
+  else
+    puts "Available ACL options are => pr : private, pur : public-read, purw : public-read-write, aer : aws-exec-read, ar : authenticated-read, bor : bucket-owner-read, bof : bucket-owner-full-control, ldw : log-delivery-write"
+    exit(false)
+  end
+
+  if options[:key].nil?
+    #  if no key then apply acl to bucket
+    begin
+      s3.put_bucket_acl({
+        acl: acl_,
+        bucket: bucket_,
+        })
+    rescue Aws::S3::Errors::NoSuchBucket
+      abort "Bucket #{bucket_} does not exist"
+    end
+  else #key present, so apply acl to object
+    begin
+      s3.put_object_acl({
+        acl: acl_,
+        bucket: bucket_,
+        key: key_,
+        })
+    rescue Aws::S3::Errors::NoSuchKey
+      abort "Key #{key_} does not exist"
+    end
+  end
+
+elsif options[:action] == :db
+  #delete a bucket
+  #check if bucket already exists
+
+  begin
+    resp = s3.head_bucket({bucket: bucket_, use_accelerate_endpoint: false})
+    bucket_exists = true
+  rescue StandardError
+    abort "Bucket #{bucket_} does not exist"
+  end
+
+  if bucket_exists
+    puts "Delete Bucket #{bucket_}?: Y/N "
+    d_bucket = STDIN.gets.chomp
+
+    if ["Y", "y"].include?(d_bucket)
+      begin
+        resp = s3.delete_bucket({
+          bucket: bucket_,
+          })
+      rescue Aws::S3::Errors::BucketNotEmpty
+        abort "Bucket #{bucket_} not empty! Empty Bucket First"
+      end
+      puts "deleting bucket..."
+      s3.wait_until(:bucket_not_exists, {
+        bucket: bucket_,
+        })
+      puts "Bucket #{bucket_} deleted"
+    elsif ["N", "n"].include?(d_bucket)
+      puts "Bucket #{bucket_} not deleted"
+    else
+      puts "Y/N only"
+    end
+  end
+
+elsif options[:action] == :ib
+
+  puts ""
+  puts "Bucket: #{bucket_} "
+  puts "====================="
+
+  total_size = 0
+  count = 0
+  begin
+    resp_ = s3.list_objects_v2(bucket: bucket_)
+    resp_.contents.each do |obj|
+      unless obj.nil?
+        total_size += obj.size
+        count += 1
+      end
+    end
+  rescue Aws::S3::Errors::NoSuchBucket
+    abort "Bucket #{bucket_} does not exist"
+  end
+
+
+  resp = s3.get_bucket_acl({bucket: bucket_})
+
+  printf("%-11s %s\n", "Size:", total_size )
+  printf("%-11s %s\n", "Objects:", count )
+  printf("%-11s %s\n", "Owner Name:", resp.owner.display_name )
+  printf("%-11s %s\n", "Owner ID:", resp.owner.id )
+  puts "---------------------"
+  # puts resp
+
+  resp.grants.each do |g|
+    printf("%-11s %s\n", "Grantee:", g.grantee.display_name )
+    printf("%-11s %s\n", "ID:", g.grantee.id )
+    printf("%-11s %s\n", "URI:", g.grantee.uri )
+    printf("%-11s %s\n", "Type:", g.grantee.type )
+    printf("%-11s %s\n", "Email:", g.grantee.email_address )
+    printf("%-11s %s\n", "Permission:", g.permission )
+    puts "---------------------"
+  end
+
+elsif options[:action] == :lf
+  #list bucket contents
+  resp = s3.list_objects_v2(bucket: bucket_)
+  puts ""
+  puts "Files in bucket #{bucket_}: "
+  puts "===================================================="
+  printf("%-19s %-8s %s\n", "Name:", "Size:", "Last Modified:")
+  resp.contents.each do |obj|
+    printf("%-19s %-8s %s\n", obj.key, obj.size, obj.last_modified)
+  end
+  puts ""
+
+elsif options[:action] == :if
+  #show file details including metadata
+  resp = s3.head_object({
+    bucket: bucket_,
+    key: key_,
+    })
+  resp_ = s3.get_object_acl({
+    bucket: bucket_,
+    key: key_
+    })
+
+  puts ""
+  printf("%-4s %-14s %-4s %s\n", "File:", key_, "Bucket:", bucket_)
+  puts "==========================================="
+  printf("%-16s %s\n", "Size:", resp.content_length)
+  printf("%-16s %s\n", "Last Modified:", resp.last_modified)
+  printf("%-16s %s\n", "Version:", resp.version_id)
+  printf("%-16s %s\n", "Metadata:", resp.metadata)
+
+  puts "ACL Details"
+  puts "==========="
+  printf("%-16s %s\n", "Owner:", resp_.owner.display_name)
+  resp_.grants.each do |g|
+    if g.grantee.display_name == nil
+      printf("%-16s %s\n", "Grantee:", "EVERYONE" )
+    else
+      printf("%-16s %s\n", "Grantee:", g.grantee.display_name )
+    end
+    if g.grantee.id == nil
+      printf("%-16s %s\n", "ID:", "-" )
+    else
+      printf("%-16s %s\n", "ID:", g.grantee.id )
+    end
+    printf("%-16s %s\n", "Permission:", g.permission )
+    puts ""
+  end
+
+
+
+
+elsif options[:action] == :f
+  #upload file to bucket
+
+  # add metadata to object if entered
+  metadata_ = {}
+
+  if !options[:meta].nil?
+    arr = options[:meta]
+    arr.each_with_index do |item, index|
+      s = item.split("=")
+      if s.length == 2
+        if index == 0 #create hash
+          # metadata_ = {s[0] => s[1]}
+          metadata_[s[0]] = s[1]
+          metadata_exists = true
+        else #add to hash
+          metadata_[s[0]] = s[1]
+        end
+      else
+        puts "Metadata format is Key=Value"
+        exit(false)
+      end
+    end
+  end
+
+  begin
+    resp_ = s3.head_object({
+      bucket: bucket_,
+      key: key_ })
+    object_exists = true
+  rescue
+  end
+
+  if !object_exists
+    obj = s3_res.bucket(bucket_).object(key_)
+    #if directory, zip up and then upload file to bucket
+    if File.directory?(file_)
+      directory = Pathname.new(file_)
+      zipfile_name = "#{directory}.zip"
+
+      Zip::ZipFile.open(zipfile_name, Zip::ZipFile::CREATE) do |zipfile|
+        #get all files/folders (recursive) including dotfiles
+        Dir.glob((File.join(directory, '**', '**')), File::FNM_DOTMATCH).each do |file|
+          path = Pathname.new(file)
+          zipfile.add(path.relative_path_from(directory), file)
+        end
+      end
+      file_ = zipfile_name
+    end
+
+    if metadata_exists
+      obj.upload_file(file_, metadata: metadata_)
+    else
+      obj.upload_file(file_)
+    end
+    #git rid of temp local zip file if exists
+    File.delete(zipfile_name) if !zipfile_name.nil? && File.exist?(zipfile_name)
+
+  else
+    puts "file #{file_} already exists"
+  end
+
+
+elsif options[:action] == :df
+  #delete file from bucket
+
+  begin
+    resp = s3.head_bucket({bucket: bucket_, use_accelerate_endpoint: false})
+    bucket_exists = true
+  rescue StandardError
+    puts 'Bucket does not exist'
+  end
+
+  if bucket_exists
+
+    begin
+      resp_ = s3.head_object({
+        bucket: bucket_,
+        key: key_})
+      object_exists = true
+    rescue
+    end
+
+    if object_exists
+      puts "Delete file #{key_} in bucket #{bucket_}?: Y/N "
+      d_key = STDIN.gets.chomp
+
+      if ["Y", "y"].include?(d_key)
+        resp = s3.delete_object({
+          bucket: bucket_,
+          key: key_,
+        })
+        puts "deleting..."
+        s3.wait_until(:object_not_exists, {
+          bucket: bucket_,
+          key: key_,
+          })
+        puts "File #{key_} deleted in bucket #{bucket_}"
+      elsif ["N", "n"].include?(d_key)
+        puts "File #{key_} not deleted"
+      else
+        puts "Y/N only"
+      end
+    else
+      puts "File #{key_} does not exist"
+    end
+  else
+    puts "Bucket #{bucket_} does not exist"
+  end
+
+
+elsif options[:action] == :rf
+  #download file from bucket
+  File.open(file_, 'wb') do |file|
+    s3.get_object({ bucket: bucket_, key: key_ }, target: file_)
+  end
+
+elsif options[:action] == :rfu
+  #download file from bucket and unzip
+  File.open(file_, 'wb') do |file|
+    s3.get_object({ bucket: bucket_, key: key_ }, target: file_)
+  end
+
+  Zip::ZipFile.open(file_) { |zip_file|
+     zip_file.each { |f|
+     f_path=File.join(File.dirname(file_), f.name)
+     FileUtils.mkdir_p(File.dirname(f_path))
+     zip_file.extract(f, f_path) unless File.exist?(f_path)
+   }
+  }
+
+  File.delete(file_) if File.exist?(file_)
+
+elsif options[:action] == :al
+  # add lifecycle
+  lifecycle_file = options[:lifecycle]
+  value = File.open(lifecycle_file, "rb").read
+  json_data = JSON.parse(value, opts={symbolize_names: true})
+  s3.put_bucket_lifecycle_configuration(:bucket => bucket_, :lifecycle_configuration => {:rules => json_data})
+
+elsif options[:action] == :dl
+  # delete lifecycle
+  resp = s3.delete_bucket_lifecycle({
+  bucket: bucket_,
+  })
+
+elsif options[:action] == :sl
+  # show lifecycle
+  begin
+    resp = s3.get_bucket_lifecycle_configuration(bucket: bucket_)
+    resp.rules.each do |rule|
+      puts rule.to_hash.to_json
+    end
+  rescue Aws::S3::Errors::NoSuchLifecycleConfiguration
+    abort "No Lifecycle Configuration"
+  end
+
+else
+  puts "see --help for usage"
+
+end

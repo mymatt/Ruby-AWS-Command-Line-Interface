@@ -1,0 +1,25 @@
+[
+  {
+    "expiration":{
+      "date":null,
+      "days":425
+    },
+    "id":"sys1lifecycle",
+    "prefix":"ProjectA",
+    "status":"Enabled",
+    "transitions": [
+      {
+        "date":null,
+        "days":30,
+        "storage_class":"STANDARD_IA"
+      },
+      {
+        "date":null,
+        "days":60,
+        "storage_class":"GLACIER"
+      }
+    ],
+    "noncurrent_version_transitions":[],
+    "noncurrent_version_expiration":null
+  }
+]
